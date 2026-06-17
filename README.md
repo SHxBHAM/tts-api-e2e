@@ -43,6 +43,14 @@ The `.env` is gitignored, so secrets never get committed.
 > On the T4 the model takes ~1 min to warm up, and generation is roughly real-time
 > (slower than a 4090). Batch runs **sequentially** on the single GPU.
 
+## Concurrency
+One GPU → generation is **serialized** by a global lock (only one `model.generate()` at a
+time; concurrent calls would race/corrupt/spike VRAM). Requests are admitted up to
+`MAX_INFLIGHT` (default 16, queued + active); beyond that the server returns **`503` fast**
+instead of piling up threads. So it safely *accepts* concurrent clients but *processes*
+them one at a time — throughput ≈ `60 / gen_time_sec` req/min. Raise real concurrency with
+lower `timesteps`, more GPUs/pods behind a load balancer, or a job queue.
+
 ## Benchmark RTF (before serving)
 Get latency/VRAM numbers on the T4 first:
 ```bash

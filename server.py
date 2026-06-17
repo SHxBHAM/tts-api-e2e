@@ -25,7 +25,8 @@ Run:  uvicorn server:app --host 0.0.0.0 --port 8000
 
 import base64
 import os
-from typing import List, Literal, Optional
+import threading
+from typing import List, Literal
 
 import torch
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -44,11 +45,21 @@ DEFAULT_CFG = float(os.environ.get("DEFAULT_CFG", 2.0))
 DEFAULT_TIMESTEPS = int(os.environ.get("DEFAULT_TIMESTEPS", 10))
 DEFAULT_BITRATE = int(os.environ.get("DEFAULT_BITRATE", 128))
 MAX_BATCH = int(os.environ.get("MAX_BATCH", 200))
+# Max requests allowed in flight (queued + generating). Beyond this we return 503 fast
+# instead of letting threads pile up on a single GPU.
+MAX_INFLIGHT = int(os.environ.get("MAX_INFLIGHT", 16))
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 app = FastAPI(title="VoxCPM2 Hinglish TTS (E2E)")
 STATE = {"model": None, "sample_rate": None}
+
+# One GPU, one model instance -> generation MUST be serialized. This lock guarantees only
+# one model.generate() runs at a time (concurrent calls would race / corrupt / spike VRAM).
+_gpu_lock = threading.Lock()
+# Admission control: cap total in-flight requests so overload fails fast (503) rather than
+# growing an unbounded queue behind the lock.
+_inflight = threading.BoundedSemaphore(MAX_INFLIGHT)
 
 
 @app.on_event("startup")
@@ -67,6 +78,18 @@ def require_token(authorization: str = Header(default="")):
         return
     if authorization != f"Bearer {API_TOKEN}":
         raise HTTPException(status_code=401, detail="Invalid or missing bearer token")
+
+
+def admit():
+    """Admission gate: take an in-flight slot or 503 immediately if the server is saturated.
+    The slot is released after the response is produced."""
+    if not _inflight.acquire(blocking=False):
+        raise HTTPException(status_code=503,
+                            detail="Server busy — too many requests in flight, retry shortly")
+    try:
+        yield
+    finally:
+        _inflight.release()
 
 
 class TTSRequest(BaseModel):
@@ -99,12 +122,14 @@ def _synth(text: str, cfg: float, timesteps: int):
     model = STATE["model"]
     if model is None:
         raise HTTPException(status_code=503, detail="Model still loading")
-    return model.generate(
-        text=text,
-        reference_wav_path=REFERENCE_WAV,
-        cfg_value=cfg,
-        inference_timesteps=timesteps,
-    )
+    # Serialize GPU access: only one generation at a time on the single T4.
+    with _gpu_lock:
+        return model.generate(
+            text=text,
+            reference_wav_path=REFERENCE_WAV,
+            cfg_value=cfg,
+            inference_timesteps=timesteps,
+        )
 
 
 @app.get("/health")
@@ -115,6 +140,7 @@ def health():
         "sample_rate": STATE["sample_rate"],
         "auth": bool(API_TOKEN),
         "max_batch": MAX_BATCH,
+        "max_inflight": MAX_INFLIGHT,
         "formats": ["mp3", "wav"],
     }
 
@@ -124,7 +150,7 @@ def index():
     return FileResponse(os.path.join(HERE, "index.html"))
 
 
-@app.post("/tts", dependencies=[Depends(require_token)])
+@app.post("/tts", dependencies=[Depends(require_token), Depends(admit)])
 def tts(req: TTSRequest):
     """Single text -> audio bytes (mp3 by default, wav if format='wav')."""
     wav = _synth(req.text, req.cfg, req.timesteps)
@@ -136,7 +162,7 @@ def tts(req: TTSRequest):
     )
 
 
-@app.post("/tts/batch", dependencies=[Depends(require_token)])
+@app.post("/tts/batch", dependencies=[Depends(require_token), Depends(admit)])
 def tts_batch(req: BatchRequest):
     """Array of texts -> JSON list of base64-encoded audio (one per input).
 
