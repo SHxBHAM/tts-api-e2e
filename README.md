@@ -19,6 +19,7 @@ MP3 is encoded with `lameenc` (a pip wheel — **no system ffmpeg needed**).
 | `server.py` | FastAPI app: `/tts`, `/tts/batch`, `/health`, `/`. Loads model once at startup. |
 | `audio_encode.py` | float32 waveform → WAV/MP3 bytes (lameenc, libsndfile fallback). |
 | `model_loader.py` | VoxCPM2 + LoRA loading (self-contained copy). |
+| `benchmark_rtf.py` | Measure Real-Time Factor (RTF) + peak VRAM on the GPU before serving. |
 | `index.html` | Minimal frontend: token, format/cfg/timesteps, Single + Batch tabs. |
 | `requirements.txt`, `start.sh` | Deps + boot script. |
 
@@ -41,6 +42,16 @@ Open the chosen `PORT` in the E2E **firewall / security group** (E2E has no auto
 The `.env` is gitignored, so secrets never get committed.
 > On the T4 the model takes ~1 min to warm up, and generation is roughly real-time
 > (slower than a 4090). Batch runs **sequentially** on the single GPU.
+
+## Benchmark RTF (before serving)
+Get latency/VRAM numbers on the T4 first:
+```bash
+cd tts_api_e2e && python benchmark_rtf.py --runs 5
+```
+Loads the model once, warms up, then times generation across short→long texts.
+Prints per-run audio duration, gen time, **RTF** (`gen_time / audio_duration`; <1 = faster
+than real-time) and peak VRAM, plus mean/median RTF, and appends to `rtf_log.csv`.
+Reads `--lora-dir` / `--reference` from env (defaults to `/workspace/assets/...`).
 
 ## API
 
