@@ -38,7 +38,7 @@ def encode_mp3(wav, sample_rate: int, bitrate: int = 128) -> bytes:
         enc.set_quality(2)  # 2 = high quality / slower; 7 = fast
         data = enc.encode(pcm.tobytes())
         data += enc.flush()
-        return data
+        return bytes(data)  # lameenc returns a bytearray; Starlette Response needs bytes
     except ImportError:
         # libsndfile >= 1.1 can write MP3 directly.
         buf = io.BytesIO()
