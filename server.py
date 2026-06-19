@@ -33,6 +33,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field, field_validator
 
+from alignment import align_words, load_aligner
 from audio_encode import CONTENT_TYPE, EXT, encode
 from model_loader import load_model
 
@@ -45,6 +46,9 @@ DEFAULT_CFG = float(os.environ.get("DEFAULT_CFG", 2.0))
 DEFAULT_TIMESTEPS = int(os.environ.get("DEFAULT_TIMESTEPS", 10))
 DEFAULT_BITRATE = int(os.environ.get("DEFAULT_BITRATE", 128))
 MAX_BATCH = int(os.environ.get("MAX_BATCH", 200))
+# Load the forced-alignment model at startup so word timestamps are available on demand.
+# Set ENABLE_ALIGN=0 to skip loading it (saves VRAM if you never request alignment).
+ENABLE_ALIGN = os.environ.get("ENABLE_ALIGN", "1") != "0"
 # Max requests allowed in flight (queued + generating). Beyond this we return 503 fast
 # instead of letting threads pile up on a single GPU.
 MAX_INFLIGHT = int(os.environ.get("MAX_INFLIGHT", 16))
@@ -52,7 +56,7 @@ MAX_INFLIGHT = int(os.environ.get("MAX_INFLIGHT", 16))
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 app = FastAPI(title="VoxCPM2 Hinglish TTS (E2E)")
-STATE = {"model": None, "sample_rate": None}
+STATE = {"model": None, "sample_rate": None, "aligner": None}
 
 # One GPU, one model instance -> generation MUST be serialized. This lock guarantees only
 # one model.generate() runs at a time (concurrent calls would race / corrupt / spike VRAM).
@@ -68,6 +72,11 @@ def _startup():
     model = load_model(LORA_DIR, LORA_STEP, load_denoiser=LOAD_DENOISER)
     STATE["model"] = model
     STATE["sample_rate"] = model.tts_model.sample_rate
+    if ENABLE_ALIGN:
+        try:
+            STATE["aligner"] = load_aligner()
+        except Exception as e:  # noqa: BLE001 — alignment is optional; don't block TTS startup
+            print(f"[warn] align model failed to load — /tts align will 503: {e}", flush=True)
     if not API_TOKEN:
         print("[warn] API_TOKEN is empty — endpoints are UNAUTHENTICATED. "
               "Set API_TOKEN before exposing the box.", flush=True)
@@ -98,6 +107,8 @@ class TTSRequest(BaseModel):
     cfg: float = Field(default=DEFAULT_CFG, ge=1.0, le=5.0)
     timesteps: int = Field(default=DEFAULT_TIMESTEPS, ge=1, le=50)
     bitrate: int = Field(default=DEFAULT_BITRATE, ge=32, le=320)
+    # When true, /tts returns JSON (base64 audio + per-word timestamps) instead of raw bytes.
+    align: bool = False
 
 
 class BatchRequest(BaseModel):
@@ -106,6 +117,8 @@ class BatchRequest(BaseModel):
     cfg: float = Field(default=DEFAULT_CFG, ge=1.0, le=5.0)
     timesteps: int = Field(default=DEFAULT_TIMESTEPS, ge=1, le=50)
     bitrate: int = Field(default=DEFAULT_BITRATE, ge=32, le=320)
+    # When true, each item gains a "words" list of per-word timestamps.
+    align: bool = False
 
     @field_validator("texts")
     @classmethod
@@ -132,6 +145,18 @@ def _synth(text: str, cfg: float, timesteps: int):
         )
 
 
+def _align(text: str, wav):
+    """Forced-align `text` to `wav`. Returns [{word, start, end, score}].
+    503 if the align model isn't loaded. Shares the GPU lock with generation."""
+    aligner = STATE["aligner"]
+    if aligner is None:
+        raise HTTPException(status_code=503,
+                            detail="Alignment unavailable — align model not loaded "
+                                   "(check ENABLE_ALIGN / startup logs)")
+    with _gpu_lock:
+        return align_words(aligner, wav, STATE["sample_rate"], text)
+
+
 @app.get("/health")
 def health():
     return {
@@ -142,6 +167,7 @@ def health():
         "max_batch": MAX_BATCH,
         "max_inflight": MAX_INFLIGHT,
         "formats": ["mp3", "wav"],
+        "align": STATE["aligner"] is not None,
     }
 
 
@@ -152,9 +178,27 @@ def index():
 
 @app.post("/tts", dependencies=[Depends(require_token), Depends(admit)])
 def tts(req: TTSRequest):
-    """Single text -> audio bytes (mp3 by default, wav if format='wav')."""
+    """Single text -> audio.
+
+    Default: raw audio bytes (mp3, or wav if format='wav').
+    With align=true: JSON {format, contentType, sampleRate, durationSec, audioBase64, words}
+    where words = [{word, start, end, score}] (timestamps in seconds).
+    """
+    sr = STATE["sample_rate"]
     wav = _synth(req.text, req.cfg, req.timesteps)
-    data = encode(wav, STATE["sample_rate"], req.format, req.bitrate)
+    data = encode(wav, sr, req.format, req.bitrate)
+
+    if req.align:
+        words = _align(req.text, wav)
+        return {
+            "format": req.format,
+            "contentType": CONTENT_TYPE[req.format],
+            "sampleRate": sr,
+            "durationSec": round(len(wav) / sr, 3) if sr else None,
+            "audioBase64": base64.b64encode(data).decode("ascii"),
+            "words": words,
+        }
+
     return Response(
         content=data,
         media_type=CONTENT_TYPE[req.format],
@@ -176,14 +220,17 @@ def tts_batch(req: BatchRequest):
             wav = _synth(text, req.cfg, req.timesteps)
             data = encode(wav, sr, req.format, req.bitrate)
             duration = len(wav) / sr if sr else None
-            items.append({
+            item = {
                 "index": i,
                 "text": text,
                 "format": req.format,
                 "contentType": CONTENT_TYPE[req.format],
                 "durationSec": round(duration, 3) if duration else None,
                 "audioBase64": base64.b64encode(data).decode("ascii"),
-            })
+            }
+            if req.align:
+                item["words"] = _align(text, wav)
+            items.append(item)
         except HTTPException:
             raise
         except Exception as e:  # noqa: BLE001 — one bad line shouldn't kill the batch
