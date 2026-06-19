@@ -82,10 +82,29 @@ open("out.mp3", "wb").write(base64.b64decode(out["audioBase64"]))
 ```
 (RunPod wraps the handler's return value under `"output"`.)
 
+## ⚠️ Payload size limits (affects batch)
+RunPod caps the payload — **including the response** — at **20 MB for `/runsync`** and
+**10 MB for `/run`**. Since this worker returns audio as base64 in JSON, a large batch can
+exceed it. Rough ceilings:
+
+| format | `/run` (10 MB) | `/runsync` (20 MB) |
+|---|---|---|
+| mp3 (128 kbps) | ~250 clips | ~500 clips |
+| wav (48 kHz 16-bit) | **~50 clips** | **~100 clips** |
+
+Guidance:
+- **Single / small batch:** base64-in-JSON is fine.
+- **Large jobs:** prefer **mp3**, keep batches modest, and use **`/run` + `/status`** (async)
+  rather than `/runsync` (a long batch on one worker can also hit `/runsync` timeouts).
+- **For real scale / true parallelism:** send many **single `/run` jobs** and let RunPod fan
+  them across workers — don't push one giant batch through a single worker.
+- If you truly need huge outputs in one call, switch to the "write to a network volume / S3
+  and return URLs" pattern instead of base64 (ask and I'll add it).
+
 ## Notes
 - **Cold start:** first request after scale-to-zero boots a worker + loads the model
   (~30–90s, more with `ENABLE_ALIGN=1`). Use `min workers ≥1` + FlashBoot to avoid it.
 - **Best fit:** batch / offline lecture-audio generation (scale up, then to zero). For
   always-on low-latency, the FastAPI pod (`start.sh`) is still simpler.
-- No GPU lock needed here — each worker processes one job at a time; RunPod adds parallelism
-  by adding workers.
+- No GPU lock needed here — each worker processes one job at a time (verified in RunPod docs);
+  RunPod adds parallelism by adding workers.
